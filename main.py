@@ -173,7 +173,7 @@ def stat_band(draw, y):
         ("HORMUZ", "2", "tankers hit mines, on fire"),
         ("HUAWEI", "10/12", "counts guilty, Brooklyn jury"),
         ("COP31", "NO PACT", "talks collapse in Antalya"),
-        ("MSCI WORLD", "-0.4%", "US tariff threats loom"),
+        ("MSCI WORLD", "-0.4%", "tariffs on 14 partners"),
         ("NVDA", "-5.9%", "AI rebound fizzles"),
         ("BRAZIL-ARG", "RECALLED", "ambassador pulled for good"),
     ]
@@ -356,7 +356,7 @@ def date_check(draw, y):
     hrule(draw, y, MARGIN, W - MARGIN, 1)
     draw.text((MARGIN, y + 8), stamp, font=f,
               fill=(ACCENT if ok else GREY))
-    note = "Rendered with Pillow \u00b7 no network"
+    note = "Rendered with Pillow \u00b7 offline \u00b7 deterministic"
     draw.text((W - MARGIN - draw.textlength(note, font=f), y + 8), note,
               font=f, fill=FAINT)
 
