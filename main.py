@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""newsimg-20261125 — newspaper front page renderer (Pillow, offline).
+"""Render the 25 November 2026 front page of "The Daily Ledger".
 
-Renders the Wednesday 25 November 2026 front page at 1024x1024:
-ivory paper, masthead, headline stat band, three illustrated hero cards,
-a five-card brief row, an "also today" list with a day-at-a-glance digest,
-and a footer date check. No network, no external assets, deterministic.
+Everything the page contains lives in one PAGE spec at the bottom of the
+file: masthead strings, the six stat boxes, three lead stories, five
+briefs, the numbered "also today" list and the timed digest. Drawing
+code is generic -- it only knows how to lay out those structures at
+1024x1024 on ivory paper, entirely offline with Pillow.
 
-Output: $MAKEFUN_OUTPUT_DIR/entry.png (default /output/entry.png).
+Output: $MAKEFUN_OUTPUT_DIR/entry.png (falls back to /output/entry.png).
 """
 
 import os
@@ -15,441 +16,431 @@ from datetime import date
 
 try:
     from PIL import Image, ImageDraw, ImageFont
-except ImportError:
+except ImportError:  # renderer still copies the bundled PNG if Pillow is gone
     Image = ImageDraw = ImageFont = None
 
-# ----------------------------------------------------------------- constants
+# ---------------------------------------------------------------- page frame
 
-W = H = 1024
-OUT = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-MARGIN = 24
-GUTTER = 12
+SIZE = 1024
+EDGE = 24          # left/right page margin
+SPACING = 12       # gap between columns
+OUTDIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
-PAPER = (244, 239, 226)        # ivory newsprint
-INK = (28, 26, 24)             # near-black body ink
-RULE = (28, 26, 24)
-FAINT = (120, 112, 100)        # captions, ear notes
-ACCENT = (156, 44, 38)         # editorial red
-CARD = (236, 229, 211)         # slightly darker card face
-CARD_EDGE = (200, 191, 170)
-SKY = (198, 214, 222)
-SEA = (60, 90, 108)
-SAND = (222, 205, 168)
-GREY = (108, 106, 100)
-TABLE = (150, 96, 66)          # wooden podium
-WOOD = (90, 62, 40)
+INK = (28, 26, 24)        # body text and rules
+RED = (156, 44, 38)       # kickers, numbers, accents
+MUTED = (120, 112, 100)   # folios, ear text
+PAPER = (244, 239, 226)   # page background
+PANEL = (236, 229, 211)   # card fill
+PANEL_RIM = (200, 191, 170)
+ASH = (108, 106, 100)     # illustration grey
+SURF = (60, 90, 108)      # sea band
+DUNE = (222, 205, 168)    # desert band
+HAZE = (198, 214, 222)    # sky band
+BRASS = (150, 96, 66)
 
-TOP_DATE = date(2026, 11, 25)  # Wednesday, 25 November 2026
+PUB_DAY = date(2026, 11, 25)
 
-F = "/usr/share/fonts/truetype"
+FONTS_DIR = "/usr/share/fonts/truetype"
 
-_FONT_CANDIDATES = {
-    "serif": ("dejavu/DejaVuSerif.ttf",
-              "liberation/LiberationSerif-Regular.ttf"),
-    "serif-b": ("dejavu/DejaVuSerif-Bold.ttf",
-                "liberation/LiberationSerif-Bold.ttf"),
-    "serif-i": ("dejavu/DejaVuSerif-Italic.ttf",
-                "liberation/LiberationSerif-Italic.ttf"),
+# family -> candidate files, tried in order; first hit wins
+FAMILIES = {
+    "serif": ("dejavu/DejaVuSerif.ttf", "liberation/LiberationSerif-Regular.ttf"),
+    "serif-bold": ("dejavu/DejaVuSerif-Bold.ttf", "liberation/LiberationSerif-Bold.ttf"),
+    "serif-ital": ("dejavu/DejaVuSerif-Italic.ttf", "liberation/LiberationSerif-Italic.ttf"),
     "sans": ("liberation/LiberationSans-Regular.ttf",),
-    "sans-b": ("liberation/LiberationSans-Bold.ttf",),
+    "sans-bold": ("liberation/LiberationSans-Bold.ttf",),
     "mono": ("liberation/LiberationMono-Regular.ttf",),
-    "mono-b": ("liberation/LiberationMono-Bold.ttf",),
+    "mono-bold": ("liberation/LiberationMono-Bold.ttf",),
 }
 
-_font_cache = {}
+_fonts = {}
 
 
-def _resolve_font_path(name):
-    """First existing truetype file for a family, else None."""
-    for rel in _FONT_CANDIDATES[name]:
-        path = os.path.join(F, rel)
-        if os.path.exists(path):
-            return path
-    return None
-
-
-def font(name, size):
-    """Cached font loader (deterministic, offline, grader-safe)."""
-    key = (name, size)
-    if key not in _font_cache:
-        path = _resolve_font_path(name)
+def typeface(family, px):
+    """Memoised truetype loader; degrades to the bitmap default font."""
+    slot = (family, px)
+    if slot not in _fonts:
+        path = next((os.path.join(FONTS_DIR, rel)
+                     for rel in FAMILIES[family]
+                     if os.path.exists(os.path.join(FONTS_DIR, rel))), None)
         if path:
-            _font_cache[key] = ImageFont.truetype(path, size)
+            _fonts[slot] = ImageFont.truetype(path, px)
         else:
             try:
-                _font_cache[key] = ImageFont.load_default(size)
+                _fonts[slot] = ImageFont.load_default(px)
             except Exception:
-                _font_cache[key] = ImageFont.load_default()
-    return _font_cache[key]
+                _fonts[slot] = ImageFont.load_default()
+    return _fonts[slot]
 
 
-# ------------------------------------------------------------------- helpers
+# ------------------------------------------------------------------ text kit
 
-def wrap(draw, text, fnt, width):
-    """Greedy word wrap; returns the list of fitted lines."""
-    words, lines, cur = text.split(), [], ""
-    for word in words:
-        trial = (cur + " " + word).strip()
-        if draw.textlength(trial, font=fnt) <= width:
-            cur = trial
+def fit_lines(pen, words, face, box_w):
+    """Greedy wrap of `words` into lines that fit box_w pixels."""
+    out, run = [], ""
+    for w in words.split():
+        cand = (run + " " + w).strip()
+        if pen.textlength(cand, font=face) <= box_w:
+            run = cand
         else:
-            if cur:
-                lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
-    return lines
+            if run:
+                out.append(run)
+            run = w
+    if run:
+        out.append(run)
+    return out
 
 
-def draw_wrapped(draw, xy, text, fnt, width, fill, leading=1.22,
-                 max_lines=None):
-    """Draw wrapped text; returns the y coordinate below the last line."""
-    x, y = xy
-    lines = wrap(draw, text, fnt, width)
-    if max_lines:
-        lines = lines[:max_lines]
-    step = int(fnt.size * leading)
-    for line in lines:
-        draw.text((x, y), line, font=fnt, fill=fill)
-        y += step
+def paint_lines(pen, pos, lines, face, colour, lead=1.22, cap=None):
+    """Stamp lines top-down; answer the y just past the last baseline."""
+    x, y = pos
+    if cap:
+        lines = lines[:cap]
+    for ln in lines:
+        pen.text((x, y), ln, font=face, fill=colour)
+        y += int(face.size * lead)
     return y
 
 
-def hrule(draw, y, x0, x1, weight=1, fill=RULE):
-    draw.rectangle([x0, y, x1, y + weight - 1], fill=fill)
+def paragraph(pen, pos, text, family, px, box_w, colour=INK, lead=1.22,
+              cap=None):
+    """Wrap then draw; returns the y below the block."""
+    return paint_lines(pen, pos, fit_lines(pen, text, typeface(family, px),
+                                            box_w), typeface(family, px),
+                       colour, lead, cap)
 
 
-def vrule(draw, x, y0, y1, weight=1, fill=RULE):
-    draw.rectangle([x, y0, x + weight - 1, y1], fill=fill)
+def bar_h(pen, y, x_a, x_b, w=1, colour=INK):
+    pen.rectangle([x_a, y, x_b, y + w - 1], fill=colour)
 
 
-def kicker_tag(draw, x, y, text, fill=ACCENT):
-    draw.text((x, y), text.upper(), font=font("sans-b", 11), fill=fill)
+def bar_v(pen, x, y_a, y_b, w=1, colour=INK):
+    pen.rectangle([x, y_a, x + w - 1, y_b], fill=colour)
 
 
-def headline(draw, x, y, text, size, width, fill=INK, leading=1.08):
-    fnt = font("serif-b", size)
-    return draw_wrapped(draw, (x, y), text, fnt, width, fill, leading=leading)
+def right_text(pen, y, text, face, colour):
+    """Right-align a string against the page's right margin."""
+    pen.text((SIZE - EDGE - pen.textlength(text, font=face), y), text,
+             font=face, fill=colour)
 
 
-# ------------------------------------------------------------------ masthead
-
-def masthead(draw, top_date):
-    # top hairline and ear notes
-    hrule(draw, 26, MARGIN, W - MARGIN, 2)
-    ear = font("serif-i", 13)
-    draw.text((MARGIN, 34), "Vol. CXXVII, No. 214", font=ear, fill=FAINT)
-    right_ear = "Late Final Edition"
-    draw.text((W - MARGIN - draw.textlength(right_ear, font=ear), 34),
-              right_ear, font=ear, fill=FAINT)
-
-    # masthead title, centered
-    f = font("serif-b", 64)
-    title = "THE DAILY LEDGER"
-    draw.text(((W - draw.textlength(title, font=f)) / 2, 54), title,
-              font=f, fill=INK)
-
-    sub = font("sans", 12)
-    tag = "INDEPENDENT SINCE 1899  \u00b7  WORLD, POLITICS, SCIENCE, MARKETS"
-    draw.text(((W - draw.textlength(tag, font=sub)) / 2, 128), tag,
-              font=sub, fill=FAINT)
-
-    # dateline band
-    hrule(draw, 152, MARGIN, W - MARGIN, 2)
-    df = font("sans-b", 14)
-    left = top_date.strftime("%A, %d %B %Y").replace(" 0", " ", 1)
-    draw.text((MARGIN, 160), left.upper(), font=df, fill=INK)
-    price = "\u00a32.40  \u00b7  \u20ac2.80  \u00b7  $3.50"
-    draw.text((W - MARGIN - draw.textlength(price, font=df), 160), price,
-              font=df, fill=INK)
-    hrule(draw, 184, MARGIN, W - MARGIN, 1)
+def centre_text(pen, y, text, face, colour):
+    pen.text(((SIZE - pen.textlength(text, font=face)) / 2, y), text,
+             font=face, fill=colour)
 
 
-# ----------------------------------------------------------------- stat band
+def eyebrow(pen, x, y, text, colour=RED):
+    """Small uppercase red label that opens a card or column."""
+    pen.text((x, y), text.upper(), font=typeface("sans-bold", 11), fill=colour)
 
-def stat_band(draw, y):
-    """A thin numbered band of headline statistics under the masthead."""
-    stats = [
+
+def big_head(pen, x, y, text, px, box_w, colour=INK, lead=1.08):
+    return paragraph(pen, (x, y), text, "serif-bold", px, box_w, colour, lead)
+
+
+# ------------------------------------------------------------------ sections
+
+def head_masthead(pen):
+    """Hairline, ear notes, title, strapline and the dateline strip."""
+    bar_h(pen, 26, EDGE, SIZE - EDGE, 2)
+    ear = typeface("serif-ital", 13)
+    pen.text((EDGE, 34), "Vol. CXXVII, No. 214", font=ear, fill=MUTED)
+    right_text(pen, 34, "Late Final Edition", ear, MUTED)
+
+    centre_text(pen, 54, "THE DAILY LEDGER", typeface("serif-bold", 64), INK)
+    centre_text(pen, 128,
+                "INDEPENDENT SINCE 1899  \u00b7  WORLD, POLITICS, SCIENCE, MARKETS",
+                typeface("sans", 12), MUTED)
+
+    bar_h(pen, 152, EDGE, SIZE - EDGE, 2)
+    dl = typeface("sans-bold", 14)
+    dateline = PUB_DAY.strftime("%A, %d %B %Y").replace(" 0", " ", 1)
+    pen.text((EDGE, 160), dateline.upper(), font=dl, fill=INK)
+    right_text(pen, 160, "\u00a32.40  \u00b7  \u20ac2.80  \u00b7  $3.50", dl, INK)
+    bar_h(pen, 184, EDGE, SIZE - EDGE, 1)
+
+
+def head_stats(pen, y, cells):
+    """One bordered strip of labelled numbers, divided by thin rules."""
+    f_num, f_lab, f_sub = (typeface(*t) for t in
+                           (("mono-bold", 17), ("sans-bold", 10), ("sans", 9)))
+    x_a, x_b = EDGE, SIZE - EDGE
+    span = (x_b - x_a) / len(cells)
+    pen.rectangle([x_a, y, x_b, y + 58], outline=INK, width=1)
+    for i, (label, value, note) in enumerate(cells):
+        cx = x_a + span * i + 12
+        pen.text((cx, y + 8), label, font=f_lab, fill=RED)
+        pen.text((cx, y + 22), value, font=f_num, fill=INK)
+        pen.text((cx, y + 43), note, font=f_sub, fill=MUTED)
+        if i:
+            bar_v(pen, int(x_a + span * i), y + 6, y + 52)
+    return y + 58
+
+
+def lead_frame(pen, x, y, w, h, eyebrow_txt, head_txt, body_txt, folio):
+    """Card scaffolding shared by all three leads: panel + picture slot.
+
+    Answers (picture_y, picture_h) so each story can paint its own scene.
+    """
+    pen.rectangle([x, y, x + w, y + h], fill=PANEL, outline=PANEL_RIM)
+    pic_y, pic_h = y + 12, 96
+    eyebrow(pen, x + 14, pic_y + pic_h + 20, eyebrow_txt)
+    head_y = big_head(pen, x + 14, pic_y + pic_h + 38, head_txt, 20, w - 28)
+    body_end = paragraph(pen, (x + 14, head_y + 6), body_txt, "serif", 12,
+                         w - 28, INK, lead=1.26, cap=3)
+    pen.text((x + 14, max(body_end + 4, y + h - 22)), folio,
+             font=typeface("serif-ital", 11), fill=MUTED)
+    return pic_y, pic_h
+
+
+def lead_hormuz(pen, x, y, w, h):
+    """Tankers burning in the strait: desert shore over dark water."""
+    pic_y, pic_h = lead_frame(
+        pen, x, y, w, h, "Middle East",
+        "Two tankers hit naval mines, catch fire in Strait of Hormuz",
+        "IRGC Navy said the ships took an unauthorised route; a third "
+        "tanker burned overnight. Saudi forces down 4 drones over "
+        "Ras Tanura as Houthi tension rises.",
+        "Report, p. 4")
+    pen.rectangle([x + 12, pic_y, x + w - 12, pic_y + pic_h],
+                  fill=DUNE, outline=INK)
+    water = pic_y + int(pic_h * 0.52)
+    pen.rectangle([x + 12, water, x + w - 12, pic_y + pic_h],
+                  fill=SURF, outline=INK)
+    for frac, flame_h, burning in ((0.30, 26, True), (0.60, 20, True),
+                                   (0.80, 0, False)):
+        bow = x + 12 + int((w - 24) * frac)
+        deck = water + 8
+        pen.rectangle([bow - 12, deck, bow + 12, deck + 12],
+                      fill=ASH, outline=INK)
+        if burning:
+            pen.polygon([(bow - 4, deck), (bow, deck - flame_h),
+                         (bow + 4, deck)], fill=RED)
+            pen.ellipse([bow - 8, deck - flame_h - 6, bow + 8,
+                         deck - flame_h + 8], fill=(60, 50, 44))
+
+
+def lead_huawei(pen, x, y, w, h):
+    """Courthouse scene: scales of justice on a plinth."""
+    pic_y, pic_h = lead_frame(
+        pen, x, y, w, h, "US-Court",
+        "Brooklyn jury convicts Huawei on 10 of 12 counts",
+        "Bank and wire fraud, sanctions violations and trade-secret "
+        "theft; acquitted of racketeering conspiracy after the "
+        "months-long federal trial.",
+        "Analysis, p. 6")
+    pen.rectangle([x + 12, pic_y, x + w - 12, pic_y + pic_h],
+                  fill=HAZE, outline=INK)
+    pavement = pic_y + int(pic_h * 0.78)
+    pen.rectangle([x + 12, pavement, x + w - 12, pic_y + pic_h], fill=ASH)
+    wall_a = x + int((w - 24) * 0.30) + 12
+    wall_b = x + int((w - 24) * 0.70) + 12
+    pen.rectangle([wall_a, pavement - 78, wall_b, pavement],
+                  fill=PAPER, outline=INK)
+    mid = (wall_a + wall_b) // 2
+    pen.polygon([(mid - 16, pavement), (mid + 16, pavement),
+                 (mid, pavement - 26)], fill=PAPER, outline=INK)
+    pen.line([(mid, pavement - 26), (mid, pavement - 46)], fill=INK, width=3)
+    pen.line([(mid - 22, pavement - 46), (mid + 22, pavement - 46)],
+             fill=INK, width=3)
+    for arm in (mid - 22, mid + 22):
+        pen.line([(arm, pavement - 46), (arm, pavement - 38)], fill=INK,
+                 width=2)
+        pen.arc([arm - 9, pavement - 44, arm + 9, pavement - 30], 0, 180,
+                fill=INK, width=2)
+
+
+def lead_ukraine(pen, x, y, w, h):
+    """Bay scene: drone vector closing on a struck cargo ship."""
+    pic_y, pic_h = lead_frame(
+        pen, x, y, w, h, "Ukraine",
+        "Zelenskyy: Ukraine hit Russian cargo ship in Gulf of Finland",
+        "Kyiv claimed the weekend drone strike that left the "
+        "sanctioned vessel ablaze; Putin calls retaliation against "
+        "refinery attacks 'inevitable'.",
+        "Report, p. 8")
+    pen.rectangle([x + 12, pic_y, x + w - 12, pic_y + pic_h],
+                  fill=HAZE, outline=INK)
+    swell = pic_y + int(pic_h * 0.46)
+    pen.rectangle([x + 12, swell, x + w - 12, pic_y + pic_h],
+                  fill=SURF, outline=INK)
+    hull = x + int((w - 24) * 0.62)
+    base = swell + 10
+    pen.rectangle([hull - 30, base, hull + 22, base + 16], fill=ASH,
+                  outline=INK)
+    pen.rectangle([hull - 6, base - 8, hull + 14, base], fill=ASH,
+                  outline=INK)
+    pen.polygon([(hull - 8, base - 8), (hull - 8, base - 30),
+                 (hull + 2, base - 8)], fill=RED)
+    drone_x = x + 16 + int((w - 32) * 0.15)
+    drone_y = swell - 6
+    pen.line([(drone_x, drone_y), (hull - 10, base + 4)], fill=PAPER, width=2)
+    pen.ellipse([drone_x - 5, drone_y - 3, drone_x + 5, drone_y + 3],
+                fill=INK)
+
+
+def brief_row(pen, y, briefs):
+    """Five same-sized brief cards spread across the page width."""
+    n = len(briefs)
+    gap = 8
+    cw = (SIZE - 2 * EDGE - gap * (n - 1)) / n
+    ch = 118
+    for i, (tag, blurb) in enumerate(briefs):
+        cx = int(EDGE + i * (cw + gap))
+        pen.rectangle([cx, y, int(cx + cw), y + ch], fill=PANEL,
+                      outline=PANEL_RIM)
+        eyebrow(pen, cx + 10, y + 10, tag)
+        paragraph(pen, (cx + 10, y + 32), blurb, "serif", 12, cw - 20, INK,
+                  lead=1.3, cap=5)
+        pen.line([(cx + 10, y + ch - 12), (cx + 22, y + ch - 12)],
+                 fill=RED, width=2)
+    return y + ch
+
+
+def also_column(pen, x, y, w, entries):
+    """Numbered short-story list under an 'ALSO TODAY' banner."""
+    f_no, f_txt = typeface("mono-bold", 13), typeface("serif", 13)
+    bar_h(pen, y, x, x + w, 2)
+    pen.text((x, y + 8), "ALSO TODAY", font=typeface("sans-bold", 14),
+             fill=RED)
+    bar_h(pen, y + 30, x, x + w, 1)
+    yy = y + 42
+    for n, story in enumerate(entries, 1):
+        pen.text((x, yy + 2), f"{n:02d}", font=f_no, fill=RED)
+        for ln in fit_lines(pen, story, f_txt, w - 36)[:2]:
+            pen.text((x + 36, yy), ln, font=f_txt, fill=INK)
+            yy += int(13 * 1.35)
+        yy += 11
+    return yy
+
+
+def glance_column(pen, x, y, w, schedule):
+    """Right-hand timed digest under a 'DAY AT A GLANCE' banner."""
+    bar_h(pen, y, x, x + w, 2)
+    pen.text((x, y + 8), "DAY AT A GLANCE", font=typeface("sans-bold", 14),
+             fill=RED)
+    bar_h(pen, y + 30, x, x + w, 1)
+    yy = y + 42
+    f_t, f_d = typeface("mono-bold", 12), typeface("serif", 12)
+    for stamp, blurb in schedule:
+        pen.text((x, yy + 1), stamp, font=f_t, fill=RED)
+        yy = paint_lines(pen, (x + 44, yy),
+                         fit_lines(pen, blurb, f_d, w - 44), f_d, INK,
+                         lead=1.3)
+        yy += 10
+    return yy
+
+
+def foot_check(pen, y):
+    """Footer stamp that re-derives the weekday from the calendar."""
+    good = PUB_DAY == date(2026, 11, 25) and PUB_DAY.strftime("%A") == "Wednesday"
+    stamp = (f"DATE CHECK: {PUB_DAY.isoformat()} \u00b7 "
+             f"{PUB_DAY.strftime('%A')} \u00b7 "
+             f"day {PUB_DAY.timetuple().tm_yday} of 2026 \u00b7 "
+             f"{'OK' if good else 'MISMATCH'}")
+    f = typeface("mono", 12)
+    bar_h(pen, y, EDGE, SIZE - EDGE, 1)
+    pen.text((EDGE, y + 8), stamp, font=f, fill=RED if good else ASH)
+    right_text(pen, y + 8,
+               "Rendered with Pillow \u00b7 offline \u00b7 deterministic",
+               f, MUTED)
+
+
+# --------------------------------------------------------- page copy (data)
+
+STORIES = {
+    "stats": [
         ("HORMUZ", "2", "tankers hit mines, on fire"),
         ("HUAWEI", "10/12", "counts guilty, Brooklyn jury"),
         ("COP31", "NO PACT", "talks collapse in Antalya"),
         ("MSCI WORLD", "-0.4%", "tariffs on 14 partners"),
         ("NVDA", "-5.9%", "AI rebound fizzles"),
         ("BRAZIL-ARG", "RECALLED", "ambassador pulled for good"),
-    ]
-    f_num = font("mono-b", 17)
-    f_lab = font("sans-b", 10)
-    f_sub = font("sans", 9)
-    x0, x1 = MARGIN, W - MARGIN
-    colw = (x1 - x0) / len(stats)
-    draw.rectangle([x0, y, x1, y + 58], outline=RULE, width=1)
-    for i, (lab, num, sub) in enumerate(stats):
-        cx = x0 + colw * i + 12
-        draw.text((cx, y + 8), lab, font=f_lab, fill=ACCENT)
-        draw.text((cx, y + 22), num, font=f_num, fill=INK)
-        draw.text((cx, y + 43), sub, font=f_sub, fill=FAINT)
-        if i:
-            vrule(draw, int(x0 + colw * i), y + 6, y + 52)
-    return y + 58
+    ],
+    "leads": (lead_hormuz, lead_huawei, lead_ukraine),
+    "briefs": [
+        ("MARKETS", "World stocks slip as new US tariffs on 14 partners "
+                    "loom; AI rebound fizzles, Nvidia -5.9%."),
+        ("EU", "Commission drafts \u20ac50bn tech equity fund to counter "
+               "US and China; Ukraine summit split on aid."),
+        ("ASIA", "Seoul plans metal detectors and Wi-Fi shutdowns to curb "
+                 "AI-aided exam cheating."),
+        ("AMERICAS", "Colombian forces storm Cartagena supermarket, free "
+                     "all hostages; 6 lost in Gulf plane crash."),
+        ("LATAM", "Brazil permanently recalls ambassador from Buenos "
+                  "Aires as rift with Milei deepens."),
+    ],
+    "also": [
+        "Yemeni troops kill 27 Houthis in Taiz offensive.",
+        "Rebel advance on Bunia, DR Congo, halted and reversed.",
+        "US Army plans to detonate entire lead azide stockpile in Iowa.",
+        "FAA ground stop at Chicago O'Hare after radar outage.",
+        "Libyan naval officers die after Ukrainian drone strike.",
+        "CAS overturns sports ruling in day's arbitration batch.",
+    ],
+    "digest": [
+        ("03:10", "Two tankers ablaze in Hormuz after mine strikes."),
+        ("09:00", "Brooklyn jury returns Huawei guilty verdicts."),
+        ("13:40", "Zelenskyy confirms Gulf of Finland ship strike."),
+        ("17:00", "MSCI world down 0.4% on tariff threat."),
+        ("20:15", "Cartagena siege ends, all hostages freed."),
+    ],
+}
 
 
-# ---------------------------------------------------------------- hero cards
+def compose(pen):
+    """Paint the whole sheet, top band to footer."""
+    head_masthead(pen)
+    y = head_stats(pen, 196, STORIES["stats"])
 
-def _hero_chrome(draw, x, y, w, h, tag, title, body, folio):
-    """Shared card frame: illustration band + kicker + headline + body."""
-    d = draw
-    d.rectangle([x, y, x + w, y + h], fill=CARD, outline=CARD_EDGE)
-    iy, ih = y + 12, 96
-    kicker_tag(d, x + 14, iy + ih + 20, tag)
-    hl_y = headline(d, x + 14, iy + ih + 38, title, 20, w - 28)
-    body_end = draw_wrapped(d, (x + 14, hl_y + 6), body, font("serif", 12),
-                            w - 28, INK, leading=1.26, max_lines=3)
-    fy = max(body_end + 4, y + h - 22)
-    d.text((x + 14, fy), folio, font=font("serif-i", 11), fill=FAINT)
-    return iy, ih
+    # lead trio, equal thirds
+    top = y + 14
+    lead_w = int((SIZE - 2 * EDGE - 2 * SPACING) / 3)
+    lead_h = 292
+    for i, painter in enumerate(STORIES["leads"]):
+        painter(pen, EDGE + i * (lead_w + SPACING), top, lead_w, lead_h)
+    y = top + lead_h
 
+    # brief strip
+    y = brief_row(pen, y + 14, STORIES["briefs"]) + 16
 
-def hero_hormuz(draw, x, y, w, h):
-    """Card 1 - Strait of Hormuz: two tankers ablaze on mine strike."""
-    d = draw
-    iy, ih = _hero_chrome(
-        d, x, y, w, h, "Middle East",
-        "Two tankers hit naval mines, catch fire in Strait of Hormuz",
-        "IRGC Navy said the ships took an unauthorised route; a third "
-        "tanker burned overnight. Saudi forces down 4 drones over "
-        "Ras Tanura as Houthi tension rises.",
-        "Report, p. 4")
-    d.rectangle([x + 12, iy, x + w - 12, iy + ih], fill=SAND, outline=INK)
-    horizon = iy + int(ih * 0.52)
-    d.rectangle([x + 12, horizon, x + w - 12, iy + ih], fill=SEA, outline=INK)
-    for bx, bh, fl in ((0.30, 26, 1), (0.60, 20, 1), (0.80, 0, 0)):
-        hx = x + 12 + int((w - 24) * bx)
-        hy2 = horizon + 8
-        d.rectangle([hx - 12, hy2, hx + 12, hy2 + 12], fill=GREY, outline=INK)
-        if fl:
-            d.polygon([(hx - 4, hy2), (hx, hy2 - bh), (hx + 4, hy2)],
-                      fill=ACCENT)
-            d.ellipse([hx - 8, hy2 - bh - 6, hx + 8, hy2 - bh + 8],
-                      fill=(60, 50, 44))
+    # also-today (wide left) beside the digest (narrow right)
+    left_w = int((SIZE - 2 * EDGE - 2 * SPACING) * 0.62)
+    right_x = EDGE + left_w + 2 * SPACING
+    also_column(pen, EDGE, y, left_w, STORIES["also"])
+    glance_column(pen, right_x, y, SIZE - EDGE - right_x, STORIES["digest"])
 
+    foot_check(pen, SIZE - 40)
 
-def hero_huawei(draw, x, y, w, h):
-    """Card 2 - Huawei verdict: Brooklyn courthouse with scales."""
-    d = draw
-    iy, ih = _hero_chrome(
-        d, x, y, w, h, "US-Court",
-        "Brooklyn jury convicts Huawei on 10 of 12 counts",
-        "Bank and wire fraud, sanctions violations and trade-secret "
-        "theft; acquitted of racketeering conspiracy after the "
-        "months-long federal trial.",
-        "Analysis, p. 6")
-    d.rectangle([x + 12, iy, x + w - 12, iy + ih], fill=SKY, outline=INK)
-    ground = iy + int(ih * 0.78)
-    d.rectangle([x + 12, ground, x + w - 12, iy + ih], fill=GREY)
-    bx0, bx1 = x + int((w - 24) * 0.30) + 12, x + int((w - 24) * 0.70) + 12
-    d.rectangle([bx0, ground - 78, bx1, ground], fill=PAPER, outline=INK)
-    ped = (bx0 + bx1) // 2
-    d.polygon([(ped - 16, ground), (ped + 16, ground), (ped, ground - 26)],
-              fill=PAPER, outline=INK)
-    d.line([(ped, ground - 26), (ped, ground - 46)], fill=INK, width=3)
-    d.line([(ped - 22, ground - 46), (ped + 22, ground - 46)], fill=INK,
-           width=3)
-    for sx in (ped - 22, ped + 22):
-        d.line([(sx, ground - 46), (sx, ground - 38)], fill=INK, width=2)
-        d.arc([sx - 9, ground - 44, sx + 9, ground - 30], 0, 180, fill=INK,
-              width=2)
-
-
-def hero_ukraine(draw, x, y, w, h):
-    """Card 3 - Ukraine: drone strike on ship in Gulf of Finland."""
-    d = draw
-    iy, ih = _hero_chrome(
-        d, x, y, w, h, "Ukraine",
-        "Zelenskyy: Ukraine hit Russian cargo ship in Gulf of Finland",
-        "Kyiv claimed the weekend drone strike that left the "
-        "sanctioned vessel ablaze; Putin calls retaliation against "
-        "refinery attacks 'inevitable'.",
-        "Report, p. 8")
-    d.rectangle([x + 12, iy, x + w - 12, iy + ih], fill=SKY, outline=INK)
-    surf = iy + int(ih * 0.46)
-    d.rectangle([x + 12, surf, x + w - 12, iy + ih], fill=SEA, outline=INK)
-    hx = x + int((w - 24) * 0.62)
-    hy2 = surf + 10
-    d.rectangle([hx - 30, hy2, hx + 22, hy2 + 16], fill=GREY, outline=INK)
-    d.rectangle([hx - 6, hy2 - 8, hx + 14, hy2], fill=GREY, outline=INK)
-    d.polygon([(hx - 8, hy2 - 8), (hx - 8, hy2 - 30), (hx + 2, hy2 - 8)],
-              fill=ACCENT)
-    dx, dy = x + 16 + int((w - 32) * 0.15), surf - 6
-    d.line([(dx, dy), (hx - 10, hy2 + 4)], fill=PAPER, width=2)
-    d.ellipse([dx - 5, dy - 3, dx + 5, dy + 3], fill=INK)
-
-
-# ----------------------------------------------------------------- brief row
-
-def brief_cards(draw, y, briefs):
-    """Five equal brief cards in a row."""
-    x0, x1 = MARGIN, W - MARGIN
-    n = len(briefs)
-    gap = 8
-    cw = (x1 - x0 - gap * (n - 1)) / n
-    ch = 118
-    for i, (tag, text) in enumerate(briefs):
-        cx = int(x0 + i * (cw + gap))
-        draw.rectangle([cx, y, int(cx + cw), y + ch], fill=CARD,
-                       outline=CARD_EDGE)
-        kicker_tag(draw, cx + 10, y + 10, tag)
-        draw_wrapped(draw, (cx + 10, y + 32), text, font("serif", 12),
-                     cw - 20, INK, leading=1.3, max_lines=5)
-        draw.line([(cx + 10, y + ch - 12), (cx + 22, y + ch - 12)],
-                  fill=ACCENT, width=2)
-    return y + ch
-
-
-# ---------------------------------------------------------------- also today
-
-def also_today(draw, x, y, w, items):
-    """Numbered list of shorter stories, left column."""
-    f_num = font("mono-b", 13)
-    f_txt = font("serif", 13)
-    hrule(draw, y, x, x + w, 2)
-    draw.text((x, y + 8), "ALSO TODAY", font=font("sans-b", 14), fill=ACCENT)
-    hrule(draw, y + 30, x, x + w, 1)
-    yy = y + 42
-    for i, text in enumerate(items, 1):
-        draw.text((x, yy + 2), f"{i:02d}", font=f_num, fill=ACCENT)
-        lines = wrap(draw, text, f_txt, w - 36)
-        for line in lines[:2]:
-            draw.text((x + 36, yy), line, font=f_txt, fill=INK)
-            yy += int(13 * 1.35)
-        yy += 11
-    return yy
-
-
-def day_at_a_glance(draw, x, y, w, digest):
-    """Timed digest column, right side."""
-    hrule(draw, y, x, x + w, 2)
-    draw.text((x, y + 8), "DAY AT A GLANCE", font=font("sans-b", 14),
-              fill=ACCENT)
-    hrule(draw, y + 30, x, x + w, 1)
-    yy = y + 42
-    f_t = font("mono-b", 12)
-    f_d = font("serif", 12)
-    for t, txt in digest:
-        draw.text((x, yy + 1), t, font=f_t, fill=ACCENT)
-        yy = draw_wrapped(draw, (x + 44, yy), txt, f_d, w - 44, INK,
-                          leading=1.3)
-        yy += 10
-    return yy
-
-
-# -------------------------------------------------------------------- footer
-
-def date_check(draw, y):
-    """Footer line verifying the dateline against the calendar."""
-    d = TOP_DATE
-    weekday = d.strftime("%A")
-    ok = weekday == "Wednesday" and d == date(2026, 11, 25)
-    stamp = (f"DATE CHECK: {d.isoformat()} \u00b7 {weekday} \u00b7 "
-             f"day {d.timetuple().tm_yday} of 2026 \u00b7 "
-             f"{'OK' if ok else 'MISMATCH'}")
-    f = font("mono", 12)
-    hrule(draw, y, MARGIN, W - MARGIN, 1)
-    draw.text((MARGIN, y + 8), stamp, font=f,
-              fill=(ACCENT if ok else GREY))
-    note = "Rendered with Pillow \u00b7 offline \u00b7 deterministic"
-    draw.text((W - MARGIN - draw.textlength(note, font=f), y + 8), note,
-              font=f, fill=FAINT)
-
-
-# -------------------------------------------------------------------- layout
-
-BRIEFS = [
-    ("MARKETS", "World stocks slip as new US tariffs on 14 partners "
-                "loom; AI rebound fizzles, Nvidia -5.9%."),
-    ("EU", "Commission drafts \u20ac50bn tech equity fund to counter "
-           "US and China; Ukraine summit split on aid."),
-    ("ASIA", "Seoul plans metal detectors and Wi-Fi shutdowns to curb "
-             "AI-aided exam cheating."),
-    ("AMERICAS", "Colombian forces storm Cartagena supermarket, free "
-                 "all hostages; 6 lost in Gulf plane crash."),
-    ("LATAM", "Brazil permanently recalls ambassador from Buenos "
-              "Aires as rift with Milei deepens."),
-]
-
-ALSO_ITEMS = [
-    "Yemeni troops kill 27 Houthis in Taiz offensive.",
-    "Rebel advance on Bunia, DR Congo, halted and reversed.",
-    "US Army plans to detonate entire lead azide stockpile in Iowa.",
-    "FAA ground stop at Chicago O'Hare after radar outage.",
-    "Libyan naval officers die after Ukrainian drone strike.",
-    "CAS overturns sports ruling in day's arbitration batch.",
-]
-
-DIGEST = [
-    ("03:10", "Two tankers ablaze in Hormuz after mine strikes."),
-    ("09:00", "Brooklyn jury returns Huawei guilty verdicts."),
-    ("13:40", "Zelenskyy confirms Gulf of Finland ship strike."),
-    ("17:00", "MSCI world down 0.4% on tariff threat."),
-    ("20:15", "Cartagena siege ends, all hostages freed."),
-]
 
 def render():
-    img = Image.new("RGB", (W, H), PAPER)
-    draw = ImageDraw.Draw(img)
-
-    masthead(draw, TOP_DATE)
-    y = stat_band(draw, 196)
-
-    # --- hero row: 3 cards
-    hy = y + 14
-    hw = int((W - 2 * MARGIN - 2 * GUTTER) / 3)
-    hh = 292
-    for i, fn in enumerate((hero_hormuz, hero_huawei, hero_ukraine)):
-        fn(draw, MARGIN + i * (hw + GUTTER), hy, hw, hh)
-    y = hy + hh
-
-    # --- brief row: 5 cards
-    y = brief_cards(draw, y + 14, BRIEFS) + 16
-
-    # --- also-today list (left) and digest (right)
-    left_w = int((W - 2 * MARGIN - 2 * GUTTER) * 0.62)
-    right_x = MARGIN + left_w + 2 * GUTTER
-    right_w = W - MARGIN - right_x
-    also_today(draw, MARGIN, y, left_w, ALSO_ITEMS)
-    day_at_a_glance(draw, right_x, y, right_w, DIGEST)
-
-    # --- footer
-    date_check(draw, H - 40)
-
-    out = os.path.join(OUT, "entry.png")
-    os.makedirs(OUT, exist_ok=True)
-    img.save(out)
-    return img
-
+    """Produce entry.png and answer the image."""
+    sheet = Image.new("RGB", (SIZE, SIZE), PAPER)
+    compose(ImageDraw.Draw(sheet))
+    os.makedirs(OUTDIR, exist_ok=True)
+    target = os.path.join(OUTDIR, "entry.png")
+    sheet.save(target)
+    return sheet
 
 
 if __name__ == "__main__":
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, "entry.png")
+    dest = os.path.join(out_dir, "entry.png")
 
-    # Primary behavior: render with Pillow when available (authoritative).
-    rendered = False
     if Image is not None:
         try:
-            img = render()
-            rendered = True
-            print(f"wrote {out} ({os.path.getsize(out)} bytes, "
-                  f"{img.size[0]}x{img.size[1]}, Pillow render)")
+            page = render()
+            print(f"wrote {dest} ({os.path.getsize(dest)} bytes, "
+                  f"{page.size[0]}x{page.size[1]}, Pillow render)")
+            sys.exit(0)
         except Exception as err:
             print(f"render failed ({err!r}); falling back to bundled "
                   f"entry.png", file=sys.stderr)
 
-    # Fallback: copy the committed entry.png next to this script.
-    if not rendered:
-        import shutil
-        src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+    # No Pillow (or render blew up): ship the committed image instead.
+    import shutil
+    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "entry.png")
-        shutil.copyfile(src, out)
-        print(f"wrote {out} ({os.path.getsize(out)} bytes, "
-              f"copied entry.png)")
+    shutil.copyfile(bundled, dest)
+    print(f"wrote {dest} ({os.path.getsize(dest)} bytes, copied entry.png)")
