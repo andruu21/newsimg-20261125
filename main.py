@@ -433,20 +433,23 @@ if __name__ == "__main__":
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, "entry.png")
 
-    # Primary behavior: copy the committed entry.png next to this script.
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "entry.png")
-    import shutil
-    shutil.copyfile(src, out)
-    print(f"wrote {out} ({os.path.getsize(out)} bytes, copied entry.png)")
-
-    # Optional enhancement: attempt the Pillow render only if PIL imports;
-    # on any error the copied file above remains the output.
+    # Primary behavior: render with Pillow when available (authoritative).
+    rendered = False
     if Image is not None:
         try:
             img = render()
-            print(f"re-rendered {out} ({os.path.getsize(out)} bytes, "
-                  f"{img.size[0]}x{img.size[1]})")
+            rendered = True
+            print(f"wrote {out} ({os.path.getsize(out)} bytes, "
+                  f"{img.size[0]}x{img.size[1]}, Pillow render)")
         except Exception as err:
-            print(f"render failed ({err!r}); keeping copied entry.png",
-                  file=sys.stderr)
+            print(f"render failed ({err!r}); falling back to bundled "
+                  f"entry.png", file=sys.stderr)
+
+    # Fallback: copy the committed entry.png next to this script.
+    if not rendered:
+        import shutil
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "entry.png")
+        shutil.copyfile(src, out)
+        print(f"wrote {out} ({os.path.getsize(out)} bytes, "
+              f"copied entry.png)")
